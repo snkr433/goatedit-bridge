@@ -1,0 +1,32 @@
+[project]
+name = "goatedit-bridge"
+version = "0.1.0"
+description = "Local yt-dlp bridge for the GoatEdit yt-dlp plugin — downloads on your machine, imports into the editor."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["yt-dlp", "youtube", "video", "goatedit", "video-editor"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Video",
+]
+# Unpinned on purpose: YouTube changes its signature cipher often and yt-dlp
+# ships near-daily fixes. A pinned bridge is a broken bridge within weeks.
+dependencies = ["yt-dlp"]
+
+[project.scripts]
+goatedit-bridge = "goatedit_bridge.__main__:main"
+
+[project.urls]
+Homepage = "https://ai.goatedit.com"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["goatedit_bridge"]
