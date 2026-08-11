@@ -48,6 +48,11 @@ class Job:
             "totalBytes": self.total_bytes,
             "error": self.error,
             "media": self.media or None,
+            # Where the file actually landed. Only the paired origin, holding the
+            # token, ever sees this — and it names a file on the user's own disk
+            # that they just asked us to write. Without it the panel can only say
+            # "downloaded" and leave them hunting through a temp directory.
+            "filepath": self.filepath,
         }
 
 
@@ -94,6 +99,21 @@ def probe(url: str) -> dict[str, Any]:
         }
         for h, f in sorted(heights.items(), key=lambda kv: kv[0], reverse=True)
     ]
+
+    # Plenty of sites publish exactly one rendition and do not tag it with a
+    # height — Instagram and Pinterest usually do not. That left the quality
+    # dropdown empty, which reads as "nothing to download" even though asking
+    # for no format at all gets yt-dlp's best pick, which is the only pick.
+    if not formats and (info.get("formats") or info.get("url")):
+        formats = [{
+            "formatId": "",
+            "label": "Best available",
+            "height": int(info.get("height") or 0),
+            "fps": int(info.get("fps") or 0),
+            "ext": info.get("ext") or "mp4",
+            "hasAudio": True,
+            "sizeBytes": int(info.get("filesize") or info.get("filesize_approx") or 0),
+        }]
 
     thumbnails = info.get("thumbnails") or []
     return {
@@ -208,15 +228,30 @@ class JobStore:
 
             ext = os.path.splitext(path)[1].lstrip(".").lower()
             job.filepath = path
+
+            # Sites that hand back one pre-muxed file — Instagram and Pinterest
+            # among them — leave the top-level info dict without width, height,
+            # fps or duration; those only ever appear on the format that was
+            # actually downloaded. Read through to it before giving up on a
+            # field, and report 0 rather than a guess when nobody knows: the
+            # editor probes the file itself and 0 is how it is told to.
+            def dimension(key: str) -> float:
+                for source in (info, requested):
+                    value = source.get(key)
+                    if value:
+                        return float(value)
+                return 0.0
+
             job.media = {
                 "name": info.get("title") or os.path.basename(path),
                 "type": "audio" if audio_only else _EXT_TO_TYPE.get(ext, "video"),
                 "ext": ext,
                 "sizeBytes": os.path.getsize(path),
-                "duration": float(info.get("duration") or 0),
-                "width": int(info.get("width") or 0),
-                "height": int(info.get("height") or 0),
-                "fps": float(info.get("fps") or 0),
+                "duration": dimension("duration"),
+                "width": int(dimension("width")),
+                "height": int(dimension("height")),
+                "fps": dimension("fps"),
+                "filepath": path,
             }
             job.progress = 100.0
             job.state = "ready"
