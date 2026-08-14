@@ -5,8 +5,8 @@ Runs [yt-dlp](https://github.com/yt-dlp/yt-dlp) on your own machine so the
 your IP, your cookies, no server in the middle.
 
 ```bash
-# Anywhere. Not on PyPI yet, so the wheel comes off our own domain.
-uvx --from https://ai.goatedit.com/bridge/goatedit_bridge-0.1.0-py3-none-any.whl goatedit-bridge
+# Anywhere. Not on PyPI yet, so the wheel comes off a GitHub release.
+uvx --from https://github.com/snkr433/goatedit-bridge/releases/download/v0.1.0/goatedit_bridge-0.1.0-py3-none-any.whl goatedit-bridge
 
 # From this checkout.
 cd bridge && uv run goatedit-bridge --dev
