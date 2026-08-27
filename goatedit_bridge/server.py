@@ -107,22 +107,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # A local downloader has no business being framed or sniffed.
         self.send_header("X-Content-Type-Options", "nosniff")
 
-    def _send_preview_cors(self) -> None:
-        """Headers for the one route a media element fetches for itself.
-
-        `*` rather than the paired origin because the caller is a sandboxed
-        frame and sends `Origin: null`; echoing that back would be the same
-        permission spelled more alarmingly. The ticket in the path is what
-        authorises the read, and the response is never credentialed, so `*`
-        widens nothing — anyone who could use it already had the ticket.
-        """
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "range")
-        self.send_header("Access-Control-Expose-Headers", "content-length, content-range, accept-ranges")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Max-Age", "600")
-        self.send_header("X-Content-Type-Options", "nosniff")
-
     def _guard(self) -> str | None:
         """Runs every check a request must pass. Returns the Origin, or None if it was answered with an error."""
         if not _host_is_loopback(self.headers.get("Host", "")):
@@ -152,20 +136,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # --- routes --------------------------------------------------
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        # A panel frame is sandboxed without allow-same-origin, so its requests
-        # carry `Origin: null` and can never match the paired origin. The
-        # preview route is built for exactly that caller and authenticates by
-        # ticket instead, so its preflight is answered without the origin check
-        # the token-bearing routes still get.
-        if urlparse(self.path).path.startswith("/preview/"):
-            self.send_response(204)
-            self._send_preview_cors()
-            if self.headers.get("Access-Control-Request-Private-Network") == "true":
-                self.send_header("Access-Control-Allow-Private-Network", "true")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
         origin = self._origin_ok()
         if origin is None:
             self._send_json(403, {"error": "That origin is not paired with this bridge"})
@@ -200,14 +170,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             }, origin)
             return
 
-        # Ticketed and therefore ahead of the token guard: this is the URL that
-        # goes into a <video src>, and a media element sends no Authorization
-        # header. The ticket is 192 bits from `secrets`, names one scratch file,
-        # and dies with the job.
-        if path.startswith("/preview/"):
-            self._serve_preview(path[len("/preview/"):])
-            return
-
         origin = self._guard()
         if origin is None:
             return
@@ -225,18 +187,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(404, {"error": f"No route for {path}"}, origin)
-
-    def do_HEAD(self) -> None:  # noqa: N802
-        """Only the preview route. A media element sometimes sizes a stream this
-        way before it asks for any of it; everything else here has a body worth
-        having and nothing to say without one."""
-        path = urlparse(self.path).path
-        if path.startswith("/preview/"):
-            self._serve_preview(path[len("/preview/"):])
-            return
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -267,9 +217,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         if path == "/preview":
             # Fetching a small rendition so the panel can play the video before
-            # the user commits to a quality or a range. It is an ordinary job —
-            # the panel polls /job/<id> for it like any other — but it comes
-            # back carrying the URL its bytes will be readable at.
+            # the user commits to a quality or a range. An ordinary job in every
+            # respect — the panel polls /job/<id> and then reads it off /file/,
+            # exactly as it would a real download; only the reaper treats it
+            # differently, deleting it even when downloads are being kept.
             try:
                 # Cached from the /resolve the panel already did, so this is a
                 # dictionary lookup rather than another minute of player API.
@@ -287,9 +238,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 }, origin)
                 return
             job = self.jobs.start(url, None, False, None, preview=True)
-            payload = job.public()
-            payload["previewUrl"] = f"http://127.0.0.1:{self.config.port}/preview/{job.ticket}"
-            self._send_json(202, payload, origin)
+            self._send_json(202, job.public(), origin)
             return
 
         if path == "/download":
@@ -311,88 +260,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": f"No route for {path}"}, origin)
 
     # --- file delivery -------------------------------------------
-
-    def _serve_preview(self, ticket: str) -> None:
-        """Streams a preview rendition to a <video>, honouring Range.
-
-        Seeking is the whole point of this route, and a media element will not
-        offer a scrub bar it cannot seek: it asks with `Range`, and if the answer
-        is a flat 200 it treats the stream as unseekable. So a byte range gets a
-        real 206 with `Content-Range`, and every answer advertises
-        `Accept-Ranges`.
-        """
-        job = self.jobs.by_ticket(ticket)
-        if not job or not job.filepath or not os.path.exists(job.filepath):
-            # Deliberately the same answer for a wrong ticket and a job that has
-            # expired: a preview URL should not report on tickets it was not given.
-            self.send_response(404)
-            self._send_preview_cors()
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if job.state != "ready":
-            self.send_response(409)
-            self._send_preview_cors()
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        path = job.filepath
-        # The same re-check /file/ does. We built this path ourselves from a hex
-        # job id, so it should already be inside the work dir — but this route
-        # answers without a token, and a route that answers without a token is
-        # the last place to be relying on "should".
-        if os.path.dirname(os.path.abspath(path)) != os.path.abspath(self.jobs.work_dir):
-            self.send_response(403)
-            self._send_preview_cors()
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        size = os.path.getsize(path)
-        ctype = mimetypes.guess_type(path)[0] or "video/mp4"
-        start, end = _parse_range(self.headers.get("Range", ""), size)
-
-        if start is None:
-            self.send_response(200)
-            length = size
-        else:
-            if start >= size:
-                self.send_response(416)
-                self._send_preview_cors()
-                self.send_header("Content-Range", f"bytes */{size}")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            length = end - start + 1
-            self.send_response(206)
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Accept-Ranges", "bytes")
-        # Scratch that is about to be reaped; a cached copy would outlive it.
-        self.send_header("Cache-Control", "no-store")
-        self._send_preview_cors()
-        self.end_headers()
-
-        if self.command == "HEAD":
-            return
-        remaining = length
-        with open(path, "rb") as fh:
-            if start is not None:
-                fh.seek(start)
-            while remaining > 0:
-                chunk = fh.read(min(FILE_CHUNK, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                try:
-                    self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    # Normal: the element seeked, or the panel moved on. The
-                    # socket is gone, and there is nothing left to say on it.
-                    return
 
     def _serve_file(self, job_id: str, origin: str) -> None:
         job = self.jobs.get(job_id)
@@ -417,37 +284,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         with open(path, "rb") as fh:
             while chunk := fh.read(FILE_CHUNK):
                 self.wfile.write(chunk)
-
-
-def _parse_range(header: str, size: int) -> tuple[int | None, int]:
-    """`Range: bytes=a-b` as (start, end) inclusive, or (None, size - 1).
-
-    Only the single-range form, which is the only one a media element sends.
-    Anything malformed, multi-range, or suffix-length past the file falls back
-    to the whole file rather than erroring — a 200 is always a truthful answer
-    to a range request, just a less useful one.
-    """
-    header = (header or "").strip().lower()
-    if not header.startswith("bytes=") or "," in header:
-        return None, size - 1
-    spec = header[len("bytes="):].strip()
-    first, sep, last = spec.partition("-")
-    if not sep:
-        return None, size - 1
-    try:
-        if not first:
-            # `bytes=-N`: the final N bytes.
-            length = int(last)
-            if length <= 0:
-                return None, size - 1
-            return max(0, size - length), size - 1
-        start = int(first)
-        end = int(last) if last else size - 1
-    except ValueError:
-        return None, size - 1
-    if start < 0 or end < start:
-        return None, size - 1
-    return start, min(end, size - 1)
 
 
 def make_server(config: BridgeConfig, jobs: JobStore) -> ThreadingHTTPServer:

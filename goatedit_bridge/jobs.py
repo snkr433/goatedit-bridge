@@ -7,7 +7,6 @@ import concurrent.futures
 import copy
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import threading
@@ -85,11 +84,6 @@ class Job:
     # play the video before deciding what to keep, so it never gets a friendly
     # name and it never survives the reaper, even in the user's own folder.
     ephemeral: bool = False
-    # Capability for GET /preview/<ticket>. A <video> element cannot send an
-    # Authorization header, so the credential has to live in the URL. Separate
-    # from the job id so handing the media URL to the DOM does not also hand
-    # over /job/<id>.
-    ticket: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     # What the preview arrived as, before _make_playable had its say. Kept so
     # that a preview which still will not play can be reported as the codec it
     # is, rather than as an unexplained "Format error".
@@ -430,18 +424,6 @@ class JobStore:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._name_lock = threading.Lock()
-
-    def by_ticket(self, ticket: str) -> Job | None:
-        """The preview job a media URL's ticket belongs to, if it is still live."""
-        if not ticket:
-            return None
-        with self._lock:
-            for job in self._jobs.values():
-                # Constant-time, because this string is the only thing standing
-                # between an unauthenticated GET and the file it names.
-                if job.ephemeral and secrets.compare_digest(job.ticket, ticket):
-                    return job
-        return None
 
     def get(self, job_id: str) -> Job | None:
         if not JOB_ID_RE.match(job_id):
