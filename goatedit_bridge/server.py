@@ -17,6 +17,7 @@ browser can try to reach:
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import os
 import secrets
@@ -25,12 +26,33 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
-from .jobs import JobStore, ffmpeg_available, probe
+from .jobs import JobStore, ffmpeg_available, probe, storyboard
 
 MAX_REQUEST_BODY = 64 * 1024
 FILE_CHUNK = 1024 * 1024
 
 ALLOWED_SCHEMES = ("http", "https")
+
+
+def _section(body: dict[str, Any]) -> tuple[float, float] | None:
+    """The (start, end) the panel asked for, or None for the whole video.
+
+    Both ends have to be real numbers and in order, because they are handed to
+    ffmpeg as a seek range: a reversed or non-finite pair produces a file that
+    is empty or never finishes rather than an error the user can read.
+    """
+    start_raw, end_raw = body.get("start"), body.get("end")
+    if start_raw is None and end_raw is None:
+        return None
+    try:
+        start_at, end_at = float(start_raw or 0), float(end_raw)
+    except (TypeError, ValueError):
+        raise ValueError("start and end must be numbers of seconds") from None
+    if not (math.isfinite(start_at) and math.isfinite(end_at)):
+        raise ValueError("start and end must be finite")
+    if start_at < 0 or end_at <= start_at:
+        raise ValueError("end must be greater than start, and start cannot be negative")
+    return (start_at, end_at)
 
 
 class BridgeConfig:
@@ -174,7 +196,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         body = self._read_json()
         url = str(body.get("url") or "").strip()
-        if path in ("/resolve", "/download"):
+        if path in ("/resolve", "/download", "/storyboard"):
             if not url or urlparse(url).scheme not in ALLOWED_SCHEMES:
                 self._send_json(400, {"error": "Give me an http(s) URL to work on"}, origin)
                 return
@@ -186,12 +208,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(502, {"error": str(exc)[:500]}, origin)
             return
 
+        if path == "/storyboard":
+            try:
+                self._send_json(200, storyboard(url), origin)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(502, {"error": str(exc)[:500]}, origin)
+            return
+
         if path == "/download":
             format_id = body.get("formatId")
+            try:
+                section = _section(body)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)}, origin)
+                return
             job = self.jobs.start(
                 url,
                 str(format_id) if format_id else None,
                 bool(body.get("audioOnly")),
+                section,
             )
             self._send_json(202, job.public(), origin)
             return

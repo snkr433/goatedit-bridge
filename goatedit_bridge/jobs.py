@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import concurrent.futures
+import copy
 import os
 import re
 import shutil
@@ -19,6 +22,44 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # Finished files are kept so the editor can pull them, then reaped. Two hours
 # is long enough for a user who wandered off mid-download.
 JOB_TTL_SECONDS = 2 * 60 * 60
+
+# Extracting a URL costs ~1.8s of player-API and JS-challenge work, and the
+# panel asks for the same URL twice: once to fill the quality dropdown, then
+# again the moment you press download. The second one is the same answer to the
+# same question, so /resolve leaves its result here for /download to pick up.
+# Short-lived on purpose — the media URLs inside carry their own expiry, and a
+# stale hit only costs us the extraction we were trying to skip.
+_INFO_TTL_SECONDS = 10 * 60
+_INFO_CACHE_MAX = 32
+_info_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_info_lock = threading.Lock()
+
+
+def _cache_info(url: str, info: dict[str, Any]) -> None:
+    now = time.time()
+    with _info_lock:
+        for key, (stamp, _) in list(_info_cache.items()):
+            if now - stamp > _INFO_TTL_SECONDS:
+                _info_cache.pop(key, None)
+        if len(_info_cache) >= _INFO_CACHE_MAX:
+            oldest = min(_info_cache, key=lambda k: _info_cache[k][0])
+            _info_cache.pop(oldest, None)
+        _info_cache[url] = (now, info)
+
+
+def _cached_info(url: str) -> dict[str, Any] | None:
+    with _info_lock:
+        hit = _info_cache.get(url)
+        if not hit:
+            return None
+        stamp, info = hit
+        if time.time() - stamp > _INFO_TTL_SECONDS:
+            _info_cache.pop(url, None)
+            return None
+    # Processing mutates the dict it is handed, so the cache keeps the original
+    # and every job works on its own copy.
+    return copy.deepcopy(info)
+
 
 _EXT_TO_TYPE = {
     "mp4": "video", "mkv": "video", "webm": "video", "mov": "video",
@@ -66,9 +107,12 @@ def _base_opts() -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Matches api/resolve-video.py: these clients serve the full format
-        # ladder without the "sign in to confirm you're not a bot" gate.
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv", "ios"]}},
+        # No player_client override on purpose. YouTube retires clients faster
+        # than we can re-pick one: the pinned android_vr/android/tv/ios list
+        # still probed fine but every media fetch came back 403, because those
+        # clients now need a GVS PO token we do not have. yt-dlp tracks which
+        # client works this week; the same reasoning that keeps the yt-dlp
+        # dependency unpinned in pyproject.toml keeps this unset.
     }
 
 
@@ -77,6 +121,17 @@ def probe(url: str) -> dict[str, Any]:
     opts = _base_opts() | {"skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
+    _cache_info(url, info)
+
+    def rank(f: dict[str, Any]) -> tuple[int, float]:
+        # YouTube offers most heights twice: once as a single progressive or
+        # DASH file, once as an HLS ladder. They look alike here but do not
+        # behave alike — HLS carries no filesize, so the panel loses its size
+        # label, and it arrives as hundreds of fragments, which turns a two
+        # second download into a minute. Take the non-HLS twin whenever there
+        # is one, and only then break ties on bitrate.
+        is_hls = (f.get("protocol") or "").startswith("m3u8")
+        return (0 if is_hls else 1, f.get("tbr") or 0)
 
     heights: dict[int, dict[str, Any]] = {}
     for f in info.get("formats") or []:
@@ -84,7 +139,7 @@ def probe(url: str) -> dict[str, Any]:
         if not height or f.get("vcodec") in (None, "none"):
             continue
         best = heights.get(height)
-        if not best or (f.get("tbr") or 0) > (best.get("tbr") or 0):
+        if not best or rank(f) > rank(best):
             heights[height] = f
 
     formats = [
@@ -127,6 +182,92 @@ def probe(url: str) -> dict[str, Any]:
     }
 
 
+# A filmstrip has to fit through the panel's mediated fetch as base64 text, so
+# the tier we pick is a byte budget as much as a picture-quality one. sb0 is
+# sharp but costs 1.3 MB and 36 requests on a long video; sb1 covers the same
+# video in 493 KB and 13. Anything past this budget gets a coarser tier rather
+# than a slow panel.
+_STORYBOARD_TIERS = ("sb1", "sb0", "sb2", "sb3")
+_STORYBOARD_MAX_BYTES = 600 * 1024
+_STORYBOARD_MAX_FRAGMENTS = 20
+
+
+def storyboard(url: str) -> dict[str, Any]:
+    """A scrub filmstrip for `url`, as sprite sheets the panel can slice in CSS.
+
+    The sheets are sent whole rather than cut into individual thumbnails: it
+    keeps a hard image dependency out of the bridge, and 13 sheets travel a lot
+    lighter than the 325 tiles printed on them.
+    """
+    info = _cached_info(url)
+    if info is None:
+        opts = _base_opts() | {"skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        _cache_info(url, info)
+
+    duration = float(info.get("duration") or 0)
+    by_id = {f.get("format_id"): f for f in (info.get("formats") or [])}
+    for tier in _STORYBOARD_TIERS:
+        board = by_id.get(tier)
+        if not board:
+            continue
+        fragments = board.get("fragments") or []
+        if not fragments or len(fragments) > _STORYBOARD_MAX_FRAGMENTS:
+            continue
+
+        # One request per sheet, and a long video has a dozen of them; serially
+        # that was 7.8s of staring at an empty strip.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            sheets = list(pool.map(lambda f: _fetch_sheet(f["url"]), fragments))
+        if any(sheet is None for sheet in sheets):
+            continue
+        if sum(len(sheet) for sheet in sheets) > _STORYBOARD_MAX_BYTES:
+            continue
+
+        columns = int(board.get("columns") or 0)
+        rows = int(board.get("rows") or 0)
+        if not columns or not rows:
+            continue
+        return {
+            "tier": tier,
+            "duration": duration,
+            "tileWidth": int(board.get("width") or 0),
+            "tileHeight": int(board.get("height") or 0),
+            "columns": columns,
+            "rows": rows,
+            "count": len(fragments) * columns * rows,
+            "sheets": [
+                {
+                    "start": float(sum(float(f.get("duration") or 0) for f in fragments[:i])),
+                    "duration": float(fragments[i].get("duration") or 0),
+                    "dataUri": "data:image/jpeg;base64," + base64.b64encode(sheet).decode(),
+                }
+                for i, sheet in enumerate(sheets)
+            ],
+        }
+
+    # Plenty of sites publish no storyboard at all. That is not an error — the
+    # panel falls back to its numeric in/out fields, which are what actually
+    # decide the cut anyway.
+    return {"duration": duration, "sheets": [], "count": 0}
+
+
+def _fetch_sheet(url: str) -> bytes | None:
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            return ydl.urlopen(url).read()
+    except Exception:  # noqa: BLE001 — a missing sheet just means no filmstrip
+        return None
+
+
+def _clock(seconds: float) -> str:
+    """A timestamp that survives being part of a filename — no colons."""
+    whole = int(seconds)
+    return f"{whole // 3600:02d}h{whole % 3600 // 60:02d}m{whole % 60:02d}s" if whole >= 3600 \
+        else f"{whole // 60:02d}m{whole % 60:02d}s"
+
+
 def _format_selector(format_id: str | None, audio_only: bool) -> str:
     if audio_only:
         return "ba[ext=m4a]/ba/b"
@@ -153,6 +294,7 @@ class JobStore:
         self.keep_files = keep_files
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        self._name_lock = threading.Lock()
 
     def get(self, job_id: str) -> Job | None:
         if not JOB_ID_RE.match(job_id):
@@ -160,13 +302,16 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
-    def start(self, url: str, format_id: str | None, audio_only: bool) -> Job:
+    def start(
+        self, url: str, format_id: str | None, audio_only: bool,
+        section: tuple[float, float] | None = None,
+    ) -> Job:
         self._reap()
         job = Job(id=uuid.uuid4().hex, url=url)
         with self._lock:
             self._jobs[job.id] = job
         threading.Thread(
-            target=self._run, args=(job, format_id, audio_only), daemon=True,
+            target=self._run, args=(job, format_id, audio_only, section), daemon=True,
         ).start()
         return job
 
@@ -188,7 +333,78 @@ class JobStore:
                 except OSError:
                     pass
 
-    def _run(self, job: Job, format_id: str | None, audio_only: bool) -> None:
+    def _rehome(
+        self, path: str, info: dict[str, Any],
+        section: tuple[float, float] | None, audio_only: bool,
+    ) -> str:
+        """Moves a finished download to a name the user will recognise.
+
+        The name has to say what makes this file different from the others, or
+        clipping three ranges out of one video just overwrites one file three
+        times. Quality and the in/out points are exactly that difference, so
+        they go in the name.
+        """
+        title = info.get("title") or "video"
+        video_id = info.get("id") or ""
+        parts = [f"{title} [{video_id}]" if video_id else title]
+        if audio_only:
+            parts.append("audio")
+        else:
+            height = info.get("height") or (info.get("requested_downloads") or [{}])[0].get("height")
+            if height:
+                parts.append(f"{int(height)}p")
+        if section:
+            parts.append(f"{_clock(section[0])}-{_clock(section[1])}")
+
+        ext = os.path.splitext(path)[1]
+        head = yt_dlp.utils.sanitize_filename(parts[0], restricted=False)
+        tail = yt_dlp.utils.sanitize_filename(" ".join(parts[1:]), restricted=False)
+        # Same path budget as trim_file_name. What gets cut matters: the tail is
+        # the quality and the timecodes, the only thing telling two clips of one
+        # video apart, so the title gives up its characters first. Trimming the
+        # other way round turned 00m10s-00m20s and 00m15s-00m25s into the same
+        # "00m1" and put the collision straight back.
+        room = max(24, 120 - len(ext) - len(tail) - 1)
+        stem = (head[:room] + " " + tail).strip() if tail else head[:room]
+
+        # Two jobs can want one name at the same moment, so picking it and
+        # claiming it happen together rather than one after the other.
+        with self._name_lock:
+            target = os.path.join(self.work_dir, stem + ext)
+            n = 2
+            while os.path.exists(target):
+                target = os.path.join(self.work_dir, f"{stem} ({n}){ext}")
+                n += 1
+            try:
+                os.replace(path, target)
+            except OSError:
+                # A rename that fails leaves a perfectly good file where it is;
+                # losing the download over its name would be the worse outcome.
+                return path
+        return target
+
+    @staticmethod
+    def _extract(ydl: yt_dlp.YoutubeDL, url: str) -> dict[str, Any]:
+        """The formats for `url`, downloaded — reusing /resolve's work if it is
+        still around. Format selection happens here rather than at extraction,
+        so the cached dict serves any quality the user ends up picking.
+
+        A cached dict can go stale in ways that are hard to predict per site, so
+        any failure re-extracts from scratch instead of surfacing as a download
+        error the user cannot act on.
+        """
+        cached = _cached_info(url)
+        if cached:
+            try:
+                return ydl.process_video_result(cached, download=True)
+            except Exception:  # noqa: BLE001 — a stale hit is not worth failing over
+                pass
+        return ydl.extract_info(url, download=True)
+
+    def _run(
+        self, job: Job, format_id: str | None, audio_only: bool,
+        section: tuple[float, float] | None = None,
+    ) -> None:
         def hook(d: dict[str, Any]) -> None:
             if d.get("status") == "downloading":
                 job.state = "downloading"
@@ -201,32 +417,54 @@ class JobStore:
                 job.state = "processing"
                 job.progress = 99.0
 
-        # In a temp dir the name is throwaway, so the job id keeps it collision-free.
-        # In the user's own folder they want to recognise what they downloaded;
-        # the video id keeps two different videos of the same name apart, and
-        # yt-dlp sanitises both fields, so the result is always a single
-        # filename directly inside work_dir.
-        name_tmpl = "%(title)s [%(id)s].%(ext)s" if self.keep_files else f"{job.id}.%(ext)s"
+        # Always download to the job id, even in the user's own folder. Naming
+        # by title used to mean two jobs on one video wrote the same path and
+        # silently stomped each other — which in-and-out points turned from an
+        # edge case into the normal one, since every clip of a video shares its
+        # title. The friendly name is put on afterwards, where a collision can
+        # be settled instead of raced.
+        name_tmpl = f"{job.id}.%(ext)s"
         opts = _base_opts() | {
             "format": _format_selector(format_id, audio_only),
             "outtmpl": os.path.join(self.work_dir, name_tmpl),
-            "trim_file_name": 120,
+            # yt-dlp measures trim_file_name against the whole path, not the
+            # basename its docstring names, so a --dir a few folders deep spends
+            # the budget on the directory and leaves a stub: a 117-character
+            # folder turned a 92-character title into "Nai.mp4". Budget from the
+            # end of work_dir instead, and keep enough room that the longest
+            # title still survives on a shallow folder.
+            "trim_file_name": len(os.path.join(self.work_dir, "")) + 120,
             "progress_hooks": [hook],
             # A job is one file; a URL that expands to a playlist is user error.
             "playlist_items": "1",
+            # Fragmented formats otherwise arrive one piece at a time. Eight is
+            # where the gain flattened out in testing; sixteen was no better.
+            "concurrent_fragment_downloads": 8,
         }
         if not audio_only and ffmpeg_available():
             opts["merge_output_format"] = "mp4"
+        if section:
+            # ffmpeg range-seeks the remote stream, so a segment costs about the
+            # same wall time whatever the source length — ~15s either way in
+            # testing. That is a loss on a short video and an enormous win on a
+            # long one, which is why the panel only offers it as a choice.
+            start_at, end_at = section
+            opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start_at, end_at)])
+            # Without this the cut lands on the nearest keyframe, which can be
+            # seconds adrift of the in-point the user actually dragged to.
+            opts["force_keyframes_at_cuts"] = True
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(job.url, download=True)
+                info = self._extract(ydl, job.url)
             requested = (info.get("requested_downloads") or [{}])[0]
             path = requested.get("filepath") or ydl.prepare_filename(info)
             if not path or not os.path.exists(path):
                 raise RuntimeError("yt-dlp finished but produced no file")
 
             ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if self.keep_files:
+                path = self._rehome(path, info, section, audio_only)
             job.filepath = path
 
             # Sites that hand back one pre-muxed file — Instagram and Pinterest
@@ -247,7 +485,11 @@ class JobStore:
                 "type": "audio" if audio_only else _EXT_TO_TYPE.get(ext, "video"),
                 "ext": ext,
                 "sizeBytes": os.path.getsize(path),
-                "duration": dimension("duration"),
+                # info carries the whole video's duration even when only a
+                # section of it was written, which would tell the editor a 15
+                # second clip is three minutes long. The section length is the
+                # one fact we know better than the info dict here.
+                "duration": (section[1] - section[0]) if section else dimension("duration"),
                 "width": int(dimension("width")),
                 "height": int(dimension("height")),
                 "fps": dimension("fps"),
