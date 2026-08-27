@@ -7,6 +7,7 @@ import concurrent.futures
 import copy
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -79,6 +80,15 @@ class Job:
     filepath: str | None = None
     media: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
+    # A preview is scratch: it is a small rendition fetched so the panel can
+    # play the video before deciding what to keep, so it never gets a friendly
+    # name and it never survives the reaper, even in the user's own folder.
+    ephemeral: bool = False
+    # Capability for GET /preview/<ticket>. A <video> element cannot send an
+    # Authorization header, so the credential has to live in the URL. Separate
+    # from the job id so handing the media URL to the DOM does not also hand
+    # over /job/<id>.
+    ticket: str = field(default_factory=lambda: secrets.token_urlsafe(24))
 
     def public(self) -> dict[str, Any]:
         return {
@@ -268,6 +278,37 @@ def _clock(seconds: float) -> str:
         else f"{whole // 60:02d}m{whole % 60:02d}s"
 
 
+# What the preview player plays. Small on purpose — the point is to see the
+# shot, not to grade it — so the ladder starts at 480p and only widens when a
+# site has nothing that low.
+#
+# The obvious pick would be an already-muxed rendition, and on YouTube that is
+# format 18. It is also the one format YouTube now answers with 403 unless you
+# carry a PO token, so preferring it would make the preview fail exactly where
+# it is most wanted. Take video and audio separately and let ffmpeg put them
+# together, the same way an ordinary download already does, and keep the muxed
+# form only as the fallback for sites that offer nothing else.
+# avc1 ahead of everything, and not for quality: YouTube's 480p is usually AV1,
+# which Safari and anything but a recent Chrome cannot decode — a preview that
+# hands back a black frame is worse than no preview. H.264 at this size is
+# universal and costs a few hundred KB more.
+PREVIEW_FORMAT = (
+    "bv*[height<=480][vcodec^=avc1]+ba[ext=m4a]"
+    "/bv*[height<=480][ext=mp4]+ba[ext=m4a]"
+    "/bv*[height<=480]+ba"
+    "/bv*[vcodec^=avc1]+ba[ext=m4a]"
+    "/bv*+ba"
+    "/b[height<=480]"
+    "/b"
+)
+
+# Above this, fetching a whole low-quality copy costs more than the scrubbing it
+# buys: 360p runs a couple of MB a minute, so an hour-long source is a few
+# hundred MB fetched to pick two timestamps off a filmstrip that already works.
+# The panel is told the number so it can say why rather than just not appear.
+PREVIEW_MAX_DURATION = 20 * 60
+
+
 def _format_selector(format_id: str | None, audio_only: bool) -> str:
     if audio_only:
         return "ba[ext=m4a]/ba/b"
@@ -296,6 +337,18 @@ class JobStore:
         self._lock = threading.Lock()
         self._name_lock = threading.Lock()
 
+    def by_ticket(self, ticket: str) -> Job | None:
+        """The preview job a media URL's ticket belongs to, if it is still live."""
+        if not ticket:
+            return None
+        with self._lock:
+            for job in self._jobs.values():
+                # Constant-time, because this string is the only thing standing
+                # between an unauthenticated GET and the file it names.
+                if job.ephemeral and secrets.compare_digest(job.ticket, ticket):
+                    return job
+        return None
+
     def get(self, job_id: str) -> Job | None:
         if not JOB_ID_RE.match(job_id):
             return None
@@ -304,14 +357,14 @@ class JobStore:
 
     def start(
         self, url: str, format_id: str | None, audio_only: bool,
-        section: tuple[float, float] | None = None,
+        section: tuple[float, float] | None = None, preview: bool = False,
     ) -> Job:
         self._reap()
-        job = Job(id=uuid.uuid4().hex, url=url)
+        job = Job(id=uuid.uuid4().hex, url=url, ephemeral=preview)
         with self._lock:
             self._jobs[job.id] = job
         threading.Thread(
-            target=self._run, args=(job, format_id, audio_only, section), daemon=True,
+            target=self._run, args=(job, format_id, audio_only, section, preview), daemon=True,
         ).start()
         return job
 
@@ -325,7 +378,9 @@ class JobStore:
         if self.keep_files:
             # The job record expires so /file/<id> stops answering, but the file
             # itself is in a folder the user chose. Deleting it would be theft.
-            return
+            # Previews are the exception: the user never asked for that file and
+            # would only find it as litter beside the ones they did ask for.
+            stale = [j for j in stale if j.ephemeral]
         for job in stale:
             if job.filepath and os.path.exists(job.filepath):
                 try:
@@ -403,7 +458,7 @@ class JobStore:
 
     def _run(
         self, job: Job, format_id: str | None, audio_only: bool,
-        section: tuple[float, float] | None = None,
+        section: tuple[float, float] | None = None, preview: bool = False,
     ) -> None:
         def hook(d: dict[str, Any]) -> None:
             if d.get("status") == "downloading":
@@ -425,7 +480,7 @@ class JobStore:
         # be settled instead of raced.
         name_tmpl = f"{job.id}.%(ext)s"
         opts = _base_opts() | {
-            "format": _format_selector(format_id, audio_only),
+            "format": PREVIEW_FORMAT if preview else _format_selector(format_id, audio_only),
             "outtmpl": os.path.join(self.work_dir, name_tmpl),
             # yt-dlp measures trim_file_name against the whole path, not the
             # basename its docstring names, so a --dir a few folders deep spends
@@ -463,7 +518,7 @@ class JobStore:
                 raise RuntimeError("yt-dlp finished but produced no file")
 
             ext = os.path.splitext(path)[1].lstrip(".").lower()
-            if self.keep_files:
+            if self.keep_files and not preview:
                 path = self._rehome(path, info, section, audio_only)
             job.filepath = path
 
