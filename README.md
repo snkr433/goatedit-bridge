@@ -6,7 +6,7 @@ your IP, your cookies, no server in the middle.
 
 ```bash
 # Anywhere. Not on PyPI yet, so the wheel comes off a GitHub release.
-uvx --from https://github.com/snkr433/goatedit-bridge/releases/download/v0.1.3/goatedit_bridge-0.1.3-py3-none-any.whl goatedit-bridge
+uvx --from https://github.com/snkr433/goatedit-bridge/releases/download/v0.1.4/goatedit_bridge-0.1.4-py3-none-any.whl goatedit-bridge
 
 # From this checkout.
 cd bridge && uv run goatedit-bridge --dev

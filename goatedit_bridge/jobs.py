@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -89,6 +90,10 @@ class Job:
     # from the job id so handing the media URL to the DOM does not also hand
     # over /job/<id>.
     ticket: str = field(default_factory=lambda: secrets.token_urlsafe(24))
+    # What the preview arrived as, before _make_playable had its say. Kept so
+    # that a preview which still will not play can be reported as the codec it
+    # is, rather than as an unexplained "Format error".
+    source_codecs: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -104,6 +109,7 @@ class Job:
             # that they just asked us to write. Without it the panel can only say
             # "downloaded" and leave them hunting through a temp directory.
             "filepath": self.filepath,
+            "sourceCodecs": self.source_codecs or None,
         }
 
 
@@ -307,6 +313,94 @@ PREVIEW_FORMAT = (
 # hundred MB fetched to pick two timestamps off a filmstrip that already works.
 # The panel is told the number so it can say why rather than just not appear.
 PREVIEW_MAX_DURATION = 20 * 60
+
+# What every browser can actually decode. The format ladder above asks for
+# H.264 first, but a site that has none leaves us holding VP9, AV1 or Opus, and
+# those play in some browsers and raise a bare "Format error" in the rest —
+# which the panel cannot tell apart from a blocked fetch. So rather than trust
+# the ladder, look at the file that arrived and fix the ones that would not
+# play. Only the preview does this; a real download is the user's file and gets
+# handed over exactly as the site served it.
+PLAYABLE_VCODECS = ("h264",)
+PLAYABLE_ACODECS = ("aac", "mp3")
+
+
+def _ffprobe_codecs(path: str) -> tuple[str, str]:
+    """(video codec, audio codec) of a local file; empty when ffprobe cannot say."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    codecs = {"video": "", "audio": ""}
+    for line in out.splitlines():
+        name, _, kind = line.partition(",")
+        if kind in codecs and not codecs[kind]:
+            codecs[kind] = name
+    return codecs["video"], codecs["audio"]
+
+
+def _make_playable(path: str) -> tuple[str, str]:
+    """A browser-playable copy of a preview, plus what the original was.
+
+    Returns the path unchanged when it already holds H.264 in MP4. Otherwise
+    remuxes if only the container is wrong, and re-encodes if a codec is. The
+    note comes back either way so a failure downstream can still say what the
+    file was, instead of leaving the panel to guess.
+    """
+    vcodec, acodec = _ffprobe_codecs(path)
+    note = f"{vcodec or '?'}/{acodec or '?'}"
+    if not vcodec or not ffmpeg_available():
+        # Nothing to decide with, or nothing to decide it with. Leave it alone:
+        # an unplayable preview is a worse outcome than none, but a mangled one
+        # is worse still.
+        return path, note
+
+    is_mp4 = os.path.splitext(path)[1].lower() == ".mp4"
+    video_ok = vcodec in PLAYABLE_VCODECS
+    # No audio at all is fine — plenty of sources have none, and a silent
+    # preview still shows the shot.
+    audio_ok = not acodec or acodec in PLAYABLE_ACODECS
+    if is_mp4 and video_ok and audio_ok:
+        return path, note
+
+    out = os.path.splitext(path)[0] + ".play.mp4"
+    args = ["ffmpeg", "-y", "-v", "error", "-i", path]
+    args += ["-c:v", "copy"] if video_ok else [
+        # Scrubbing quality, not grading quality. veryfast keeps a 20 minute
+        # source — the longest a preview is allowed to be — inside a couple of
+        # minutes, and 480p is all the strip ever shows.
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-vf", "scale=-2:min(480\,ih)",
+    ]
+    if not acodec:
+        args += ["-an"]
+    else:
+        args += ["-c:a", "copy"] if audio_ok else ["-c:a", "aac", "-b:a", "128k"]
+    # Without this the moov atom lands at the end of the file and the element
+    # has to range-request its way backwards before it can show a single frame.
+    args += ["-movflags", "+faststart", out]
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=900, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return path, note
+    if done.returncode != 0 or not os.path.exists(out) or not os.path.getsize(out):
+        # A half-written re-encode is not scratch anyone will come back for, and
+        # the reaper only knows about the path the job is holding.
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return path, note
+    # The source was scratch either way; only one of the two is worth keeping.
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out, note
 
 
 def _format_selector(format_id: str | None, audio_only: bool) -> str:
@@ -517,6 +611,8 @@ class JobStore:
             if not path or not os.path.exists(path):
                 raise RuntimeError("yt-dlp finished but produced no file")
 
+            if preview:
+                path, job.source_codecs = _make_playable(path)
             ext = os.path.splitext(path)[1].lstrip(".").lower()
             if self.keep_files and not preview:
                 path = self._rehome(path, info, section, audio_only)

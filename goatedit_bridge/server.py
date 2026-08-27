@@ -338,6 +338,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
         path = job.filepath
+        # The same re-check /file/ does. We built this path ourselves from a hex
+        # job id, so it should already be inside the work dir — but this route
+        # answers without a token, and a route that answers without a token is
+        # the last place to be relying on "should".
+        if os.path.dirname(os.path.abspath(path)) != os.path.abspath(self.jobs.work_dir):
+            self.send_response(403)
+            self._send_preview_cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         size = os.path.getsize(path)
         ctype = mimetypes.guess_type(path)[0] or "video/mp4"
         start, end = _parse_range(self.headers.get("Range", ""), size)
