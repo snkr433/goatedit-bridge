@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import yt_dlp
 
@@ -397,17 +398,85 @@ def _make_playable(path: str) -> tuple[str, str]:
     return out, note
 
 
-def _format_selector(format_id: str | None, audio_only: bool) -> str:
+# Hosts whose signed media URLs ffmpeg cannot open for itself.
+#
+# Asking yt-dlp for a time range hands the URL to ffmpeg, which fetches it with
+# yt-dlp's generic web headers — and YouTube signs that URL for whichever client
+# the extractor used that day (android_vr at the time of writing), so it answers
+# 403 and the whole download fails. Nothing here can fix that: the working
+# headers are per-format and yt-dlp does not pass them to the ffmpeg downloader.
+#
+# So a range is attempted once per host and, when it fails that way, the host is
+# remembered and every later job for it downloads whole and is cut locally
+# instead — where ffmpeg reads a file off the disk and there is no URL to sign.
+_no_remote_range: set[str] = set()
+_range_lock = threading.Lock()
+
+
+def _remote_range_ok(host: str) -> bool:
+    with _range_lock:
+        return host not in _no_remote_range
+
+
+def _remember_no_remote_range(host: str) -> None:
+    with _range_lock:
+        _no_remote_range.add(host)
+
+
+def _trim_locally(path: str, start_at: float, end_at: float) -> str:
+    """`path` cut down to [start_at, end_at], or unchanged if ffmpeg cannot.
+
+    A stream copy, so it costs a read and a write rather than an encode, and the
+    picture is bit-for-bit what was downloaded. `-ss` before `-i` seeks to the
+    keyframe at or before the in-point, which can start the clip a little early;
+    for b-roll that is the right trade against re-encoding every candidate, and
+    the caller pads the range for it.
+    """
+    if not ffmpeg_available():
+        return path
+    stem, ext = os.path.splitext(path)
+    out = f"{stem}.cut{ext or '.mp4'}"
+    args = [
+        "ffmpeg", "-y", "-v", "error",
+        "-ss", f"{start_at:.3f}", "-to", f"{end_at:.3f}", "-i", path,
+        "-c", "copy", "-movflags", "+faststart", out,
+    ]
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=900, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return path
+    if done.returncode != 0 or not os.path.exists(out) or not os.path.getsize(out):
+        # A whole video is a worse answer than a trimmed one but a far better
+        # answer than none, so a failed cut leaves the download alone.
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out
+
+
+def _format_selector(format_id: str | None, audio_only: bool, max_height: int = 0) -> str:
     if audio_only:
         return "ba[ext=m4a]/ba/b"
     if format_id:
         # Pair the chosen video-only rendition with the best m4a; yt-dlp falls
         # back to the bare format when it already carries audio.
         return f"{format_id}+ba[ext=m4a]/{format_id}"
+    # Without a cap, "best" on YouTube means AV1 2160p: gigabytes of master for
+    # a shot that will be muted and cut to six seconds. A caller that knows how
+    # small the picture may be says so, and the extra `bv*+ba` rung covers the
+    # sites whose capped rendition is not mp4 — without it a cap could fall all
+    # the way through to an uncapped progressive file and undo itself.
+    cap = f"[height<={max_height}]" if max_height > 0 else ""
     if ffmpeg_available():
-        return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+        return f"bv*{cap}[ext=mp4]+ba[ext=m4a]/bv*{cap}+ba/b{cap}[ext=mp4]/b{cap}"
     # No ffmpeg means no muxing, so only already-combined streams will play.
-    return "b[ext=mp4]/b"
+    return f"b{cap}[ext=mp4]/b{cap}"
 
 
 class JobStore:
@@ -434,13 +503,16 @@ class JobStore:
     def start(
         self, url: str, format_id: str | None, audio_only: bool,
         section: tuple[float, float] | None = None, preview: bool = False,
+        max_height: int = 0,
     ) -> Job:
         self._reap()
         job = Job(id=uuid.uuid4().hex, url=url, ephemeral=preview)
         with self._lock:
             self._jobs[job.id] = job
         threading.Thread(
-            target=self._run, args=(job, format_id, audio_only, section, preview), daemon=True,
+            target=self._run,
+            args=(job, format_id, audio_only, section, preview, max_height),
+            daemon=True,
         ).start()
         return job
 
@@ -535,6 +607,7 @@ class JobStore:
     def _run(
         self, job: Job, format_id: str | None, audio_only: bool,
         section: tuple[float, float] | None = None, preview: bool = False,
+        max_height: int = 0,
     ) -> None:
         def hook(d: dict[str, Any]) -> None:
             if d.get("status") == "downloading":
@@ -556,7 +629,7 @@ class JobStore:
         # be settled instead of raced.
         name_tmpl = f"{job.id}.%(ext)s"
         opts = _base_opts() | {
-            "format": PREVIEW_FORMAT if preview else _format_selector(format_id, audio_only),
+            "format": PREVIEW_FORMAT if preview else _format_selector(format_id, audio_only, max_height),
             "outtmpl": os.path.join(self.work_dir, name_tmpl),
             # yt-dlp measures trim_file_name against the whole path, not the
             # basename its docstring names, so a --dir a few folders deep spends
@@ -574,11 +647,17 @@ class JobStore:
         }
         if not audio_only and ffmpeg_available():
             opts["merge_output_format"] = "mp4"
-        if section:
-            # ffmpeg range-seeks the remote stream, so a segment costs about the
-            # same wall time whatever the source length — ~15s either way in
-            # testing. That is a loss on a short video and an enormous win on a
-            # long one, which is why the panel only offers it as a choice.
+
+        host = urlparse(job.url).hostname or ""
+        # Two ways to get a section, and the cheap one does not always work.
+        # Remotely, ffmpeg range-seeks the stream and only the wanted seconds
+        # ever cross the network. Locally, the whole file arrives and is cut on
+        # disk — the bytes are spent but the result is identical, and no signed
+        # URL is involved, so it cannot 403. Try the cheap one; remember a host
+        # that refuses it so the rest of a run goes straight to the one that
+        # works.
+        want_remote_range = bool(section) and _remote_range_ok(host)
+        if section and want_remote_range:
             start_at, end_at = section
             opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start_at, end_at)])
             # Without this the cut lands on the nearest keyframe, which can be
@@ -586,13 +665,30 @@ class JobStore:
             opts["force_keyframes_at_cuts"] = True
 
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = self._extract(ydl, job.url)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = self._extract(ydl, job.url)
+            except Exception:
+                if not want_remote_range:
+                    raise
+                # The range is the only thing worth retrying without: a whole
+                # download that also fails is a real failure, and reports itself.
+                _remember_no_remote_range(host)
+                opts.pop("download_ranges", None)
+                opts.pop("force_keyframes_at_cuts", None)
+                want_remote_range = False
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = self._extract(ydl, job.url)
             requested = (info.get("requested_downloads") or [{}])[0]
             path = requested.get("filepath") or ydl.prepare_filename(info)
             if not path or not os.path.exists(path):
                 raise RuntimeError("yt-dlp finished but produced no file")
 
+            if section and not want_remote_range:
+                # Downloaded whole because the host would not serve a range, so
+                # the cut still has to happen — just here, against a file.
+                job.state = "processing"
+                path = _trim_locally(path, section[0], section[1])
             if preview:
                 path, job.source_codecs = _make_playable(path)
             ext = os.path.splitext(path)[1].lstrip(".").lower()

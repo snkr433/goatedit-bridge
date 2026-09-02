@@ -55,6 +55,26 @@ def _section(body: dict[str, Any]) -> tuple[float, float] | None:
     return (start_at, end_at)
 
 
+def _max_height(body: dict[str, Any]) -> int:
+    """The tallest picture the caller will accept, or 0 for no ceiling.
+
+    A caller that knows the shot is going to be six muted seconds of b-roll can
+    say so and skip the 4K master. Rejected rather than clamped when it is not a
+    sane number: silently downloading something other than what was asked for is
+    how a caller ends up trusting a cap that never applied.
+    """
+    raw = body.get("maxHeight")
+    if raw is None:
+        return 0
+    try:
+        height = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("maxHeight must be a number of pixels") from None
+    if height < 0:
+        raise ValueError("maxHeight cannot be negative")
+    return height
+
+
 class BridgeConfig:
     def __init__(self, port: int, token: str, origins: list[str]) -> None:
         self.port = port
@@ -248,11 +268,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, {"error": str(exc)}, origin)
                 return
+            try:
+                max_height = _max_height(body)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)}, origin)
+                return
             job = self.jobs.start(
                 url,
                 str(format_id) if format_id else None,
                 bool(body.get("audioOnly")),
                 section,
+                max_height=max_height,
             )
             self._send_json(202, job.public(), origin)
             return

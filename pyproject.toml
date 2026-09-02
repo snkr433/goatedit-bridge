@@ -1,6 +1,6 @@
 [project]
 name = "goatedit-bridge"
-version = "0.1.5"
+version = "0.2.0"
 description = "Local yt-dlp bridge for the GoatEdit yt-dlp plugin — downloads on your machine, imports into the editor."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +16,13 @@ classifiers = [
 ]
 # Unpinned on purpose: YouTube changes its signature cipher often and yt-dlp
 # ships near-daily fixes. A pinned bridge is a broken bridge within weeks.
-dependencies = ["yt-dlp"]
+#
+# The floor is not decoration. It sat at 2025.10.14 for eleven months, which let
+# a bridge run a yt-dlp two months stale — and a stale one does not fail
+# loudly: every YouTube download returns 403 Forbidden, which reads as a
+# blocked IP or a bad token rather than as "update me". Raise this to whatever
+# is known to work whenever that happens again.
+dependencies = ["yt-dlp>=2026.08.19"]
 
 [project.scripts]
 goatedit-bridge = "goatedit_bridge.__main__:main"
