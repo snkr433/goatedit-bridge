@@ -1,6 +1,6 @@
 [project]
 name = "goatedit-bridge"
-version = "0.2.0"
+version = "0.5.0"
 description = "Local yt-dlp bridge for the GoatEdit yt-dlp plugin — downloads on your machine, imports into the editor."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,10 @@ classifiers = [
 # loudly: every YouTube download returns 403 Forbidden, which reads as a
 # blocked IP or a bad token rather than as "update me". Raise this to whatever
 # is known to work whenever that happens again.
-dependencies = ["yt-dlp>=2026.08.19"]
+# Pillow renders the title/caption cards the timeline compiler overlays. Without
+# it the compiler still runs and every title silently vanishes from the export,
+# which is the worst way to find out a dependency is missing.
+dependencies = ["yt-dlp>=2026.08.19", "pillow>=10.0"]
 
 [project.scripts]
 goatedit-bridge = "goatedit_bridge.__main__:main"
