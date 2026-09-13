@@ -37,7 +37,7 @@ from . import __version__
 from .ai_engine import detect_silences
 from .jobs import PREVIEW_MAX_DURATION, JobStore, _clock, ffmpeg_available, probe, storyboard
 from .localfs import LocalFs, LocalFsError, contains
-from .proxies import proxy_manager
+from .proxies import needs_proxy, proxy_manager
 from .render import probe_hardware, render_manager
 from .timeline_compiler import ClipSpec, TimelineSpec, TrackSpec, timeline_manager
 
@@ -113,6 +113,11 @@ _MEDIA_EXTENSIONS = frozenset().union(*_EXT_CLASSES.values())
 _SKIP_DIR_NAMES = frozenset({
     "Library", "Applications", ".git", "node_modules",
     "DerivedData", "Pictures", "Music", "System",
+    # Proxies sit beside the footage they came from, so a media walk would
+    # otherwise index them as findable sources. Locate has to answer with the
+    # original: relinking a project to its own proxies would silently pin the
+    # edit to 540p, including on export.
+    "Proxies",
 })
 
 
@@ -386,10 +391,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         expected = f"Bearer {self.config.token}"
         # Constant-time: the token is the only secret here.
-        if not secrets.compare_digest(auth, expected):
-            self._send_json(401, {"error": "Missing or wrong bridge token"}, origin)
-            return None
-        return origin
+        if secrets.compare_digest(auth, expected):
+            return origin
+
+        # A <video src="..."> cannot send an Authorization header, and a proxy
+        # exists precisely to be played by one. Without this, every proxy URL we
+        # hand the editor answers 401 to the element that has to play it, while
+        # working fine from fetch() — which is exactly how it shipped past a
+        # unit test and was caught only end to end.
+        #
+        # Accepted on GET only, so nothing that changes state can be triggered
+        # by a URL alone, and still compared in constant time. The token is
+        # already a loopback-only secret; putting it in a query string on
+        # 127.0.0.1 does not widen who can reach it.
+        if self.command == "GET":
+            query = parse_qs(urlparse(self.path).query)
+            supplied = (query.get("token") or [""])[0]
+            if supplied and secrets.compare_digest(supplied, self.config.token):
+                return origin
+
+        self._send_json(401, {"error": "Missing or wrong bridge token"}, origin)
+        return None
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -972,10 +994,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(200, job.public(), origin)
             return
 
+        if path == "/proxy/plan":
+            # Answers "should this file be proxied?" without transcoding anything,
+            # so the editor can skip the work for footage the browser can already
+            # hardware-decode instead of proxying a whole bin on import.
+            try:
+                source_path = str(body.get("sourcePath", ""))
+                self._send_json(200, needs_proxy(source_path), origin)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"error": str(exc)}, origin)
+            return
+
         if path == "/proxy/generate":
             try:
                 source_path = str(body.get("sourcePath", ""))
-                height = int(body.get("height", 720))
+                height = int(body.get("height", 540))
                 codec_id = str(body.get("codec", "h264_hw"))
                 proxy_job = proxy_manager.create_proxy(source_path, height=height, codec_id=codec_id)
                 self._send_json(200, proxy_job.public(), origin)
@@ -1056,21 +1089,66 @@ class BridgeHandler(BaseHTTPRequestHandler):
             contains(os.path.realpath(root), abs_path)
             for root in (self.jobs.work_dir, proxy_manager.cache_dir)
         )
+        # Proxies are written beside the footage they came from, so a directory
+        # test cannot authorise them any more. `is_known_target` authorises the
+        # exact files this process produced — one path per job, never a folder,
+        # so a media directory does not become browsable.
+        if not valid_dir and proxy_manager.is_known_target(abs_path):
+            valid_dir = True
         if not valid_dir:
             self._send_json(403, {"error": "Refusing to serve a file outside approved directories"}, origin)
             return
 
         size = os.path.getsize(path)
         ctype = mimetypes.guess_type(path)[0] or "video/mp4"
-        self.send_response(200)
+
+        # Range support, because the consumer is a <video> element. Without a 206
+        # the browser has to pull the whole file before it can show frame one and
+        # cannot seek inside it at all — which is the entire point of a proxy.
+        start, end = 0, size - 1
+        status = 200
+        rng = self.headers.get("Range", "")
+        match = re.match(r"bytes=(\d*)-(\d*)\s*$", rng) if rng else None
+        if match:
+            first, last = match.group(1), match.group(2)
+            if first:
+                start = int(first)
+                end = int(last) if last else size - 1
+            elif last:
+                # "bytes=-500" means the LAST 500 bytes, not the first 500.
+                start = max(0, size - int(last))
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self._send_cors(origin)
+                self.end_headers()
+                return
+            end = min(end, size - 1)
+            status = 206
+
+        length = end - start + 1
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Disposition", "inline")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self._send_cors(origin)
         self.end_headers()
         with open(path, "rb") as fh:
-            while chunk := fh.read(FILE_CHUNK):
-                self.wfile.write(chunk)
+            fh.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = fh.read(min(FILE_CHUNK, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # A <video> abandons ranges constantly while seeking. Normal.
+                    return
+                remaining -= len(chunk)
 
 
 def make_server(config: BridgeConfig, jobs: JobStore) -> ThreadingHTTPServer:
