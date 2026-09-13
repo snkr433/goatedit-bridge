@@ -558,6 +558,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         self._body_too_large = False
 
+        if path == "/shutdown":
+            # Stopping the bridge from the page it serves. The only way to stop
+            # it used to be Ctrl-C in whichever terminal it was started from,
+            # which is fine when you remember where that is and unhelpful
+            # otherwise — the process outlives the tab that needed it.
+            #
+            # POST, so no URL alone can trigger it, and behind the same guard as
+            # every other route: loopback host, paired origin, constant-time
+            # token. A page that can already ask this bridge to transcode is not
+            # being handed anything new by being able to ask it to stop.
+            body = self._read_json()
+            busy = self.jobs.busy()
+            if busy and not body.get("force"):
+                # Work in flight is worth one round trip. The caller decides;
+                # it just does not get to decide by accident.
+                self._send_json(409, {
+                    "error": "Jobs are still running",
+                    "busy": busy,
+                }, origin)
+                return
+            self._send_json(200, {"stopping": True, "interrupted": busy}, origin)
+            # After the reply is on the wire, never before: shutdown() blocks
+            # until the serve loop exits, and calling it inline would deadlock
+            # this very request.
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+
         if path == "/render/frame":
             session_id = self.headers.get("X-Session-Id") or parse_qs(urlparse(self.path).query).get("sessionId", [None])[0]
             if not session_id:

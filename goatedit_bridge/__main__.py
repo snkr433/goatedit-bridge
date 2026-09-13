@@ -149,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     _banner(args.port, token, origins, work_dir, keep, localfs.roots)
     try:
         httpd.serve_forever()
+        # serve_forever returning on its own means /shutdown was called, so say
+        # so — otherwise the window simply goes quiet and looks like a crash.
+        print("\n  Stopped from the editor." if keep
+              else "\n  Stopped from the editor. Downloaded files are being cleaned up.")
     except KeyboardInterrupt:
         print(f"\n  Stopping. Files left in {work_dir}." if keep
               else "\n  Stopping. Downloaded files are being cleaned up.")

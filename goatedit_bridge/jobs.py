@@ -494,6 +494,12 @@ class JobStore:
         self._lock = threading.Lock()
         self._name_lock = threading.Lock()
 
+    def busy(self) -> list[str]:
+        """Ids of jobs still doing work — what a shutdown would interrupt."""
+        with self._lock:
+            return [j.id for j in self._jobs.values()
+                    if j.state in ("queued", "downloading", "processing")]
+
     def get(self, job_id: str) -> Job | None:
         if not JOB_ID_RE.match(job_id):
             return None
